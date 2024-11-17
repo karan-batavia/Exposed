@@ -13,6 +13,7 @@ import org.jetbrains.exposed.sql.tests.TestDB
 import org.jetbrains.exposed.sql.tests.shared.assertEquals
 import org.jetbrains.exposed.sql.tests.shared.assertTrue
 import org.jetbrains.exposed.sql.tests.shared.expectException
+import org.jetbrains.exposed.sql.transactions.JdbcTransaction
 import org.jetbrains.exposed.sql.transactions.TransactionManager
 import org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransaction
 import org.jetbrains.exposed.sql.transactions.transaction
@@ -118,6 +119,7 @@ class ConnectionPoolTests : LogDbInTestName() {
 private val TestTable = object : IntIdTable("HIKARI_TESTER") { }
 
 private fun Transaction.getReadOnlyMode(): Boolean {
+    this as JdbcTransaction
     val mode = exec("SHOW transaction_read_only;") {
         it.next()
         it.getBoolean(1)

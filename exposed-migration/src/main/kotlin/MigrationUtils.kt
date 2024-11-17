@@ -1,5 +1,4 @@
 import org.jetbrains.exposed.sql.*
-import org.jetbrains.exposed.sql.SchemaUtils.checkMappingConsistence
 import org.jetbrains.exposed.sql.transactions.TransactionManager
 import org.jetbrains.exposed.sql.vendors.H2Dialect
 import org.jetbrains.exposed.sql.vendors.PostgreSQLDialect

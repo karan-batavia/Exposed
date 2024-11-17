@@ -10,6 +10,7 @@ import org.intellij.lang.annotations.Language
 import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.statements.api.ExposedDatabaseMetadata
 import org.jetbrains.exposed.sql.statements.api.IdentifierManagerApi
+import org.jetbrains.exposed.sql.statements.api.TableUtils
 import org.jetbrains.exposed.sql.transactions.TransactionManager
 import org.jetbrains.exposed.sql.vendors.*
 import org.jetbrains.exposed.sql.vendors.H2Dialect.H2MajorVersion
@@ -44,7 +45,7 @@ class R2dbcDatabaseMetadataImpl(
                 if (connectionData.databaseProductName.startsWith("Microsoft SQL Server ")) {
                     SQLServerDialect.dialectName
                 } else {
-                    Database.getDialectName(url)
+                    R2dbcDatabase.getR2dbcDialectName(url)
                         ?: error("Unsupported driver ${connectionData.databaseProductName} detected")
                 }
             }
@@ -227,6 +228,59 @@ class R2dbcDatabaseMetadataImpl(
         return names
     }
 
+    override fun existingSequences(vararg tables: Table): Map<Table, List<Sequence>> {
+        if (currentDialect !is PostgreSQLDialect) return emptyMap()
+
+        @OptIn(InternalApi::class)
+        return tables.associateWith { table ->
+            val (_, tableSchema) = tableCatalogAndSchema(null, table)
+            with(metadata) {
+                // this should be moved into vendor metadata builder, especially if other databases support
+                fetchMetadata(
+                    """
+                    SELECT seq_details.sequence_name,
+                    seq_details.start,
+                    seq_details.increment,
+                    seq_details.max,
+                    seq_details.min,
+                    seq_details.cache,
+                    seq_details.cycle
+                    FROM pg_catalog.pg_namespace tns
+                             INNER JOIN pg_catalog.pg_class t ON tns.oid = t.relnamespace AND t.relkind IN ('p', 'r')
+                             INNER JOIN pg_catalog.pg_depend d ON t.oid = d.refobjid
+                             LEFT OUTER JOIN (
+                                SELECT s.relname AS sequence_name,
+                                seq.seqstart AS start,
+                                seq.seqincrement AS increment,
+                                seq.seqmax AS max,
+                                seq.seqmin AS min,
+                                seq.seqcache AS cache,
+                                seq.seqcycle AS cycle,
+                                s.oid AS seq_id
+                                FROM pg_catalog.pg_sequence seq
+                                JOIN pg_catalog.pg_class s ON s.oid = seq.seqrelid AND s.relkind = 'S'
+                                JOIN pg_catalog.pg_namespace sns ON s.relnamespace = sns.oid
+                                WHERE sns.nspname = '$tableSchema'
+                             ) seq_details ON seq_details.seq_id = d.objid
+                    WHERE tns.nspname = '$tableSchema' AND t.relname = '${table.nameInDatabaseCaseUnquoted()}'
+                    """.trimIndent()
+                ) { row, _ ->
+                    row.getString("sequence_name")?.let {
+                        Sequence(
+                            it,
+                            row.getLong("start"),
+                            row.getLong("increment"),
+                            row.getLong("min"),
+                            row.getLong("max"),
+                            row.getBoolean("cycle"),
+                            row.getLong("cache")
+                        )
+                    }
+                }.filterNotNull()
+            }
+        }
+    }
+
     override fun sequences(): List<String> {
         val sequences = fetchMetadata(
             metadata.getSequences()
@@ -242,7 +296,8 @@ class R2dbcDatabaseMetadataImpl(
     }
 
     override fun tableConstraints(tables: List<Table>): Map<String, List<ForeignKeyConstraint>> {
-        val allTables = SchemaUtils.sortTablesByReferences(tables).associateBy { it.nameInDatabaseCaseUnquoted() }
+        @OptIn(InternalApi::class)
+        val allTables = TableUtils.sortTablesByReferences(tables).associateBy { it.nameInDatabaseCaseUnquoted() }
         val allTableNames = allTables.keys
         val isMysqlDialect = currentDialect is MysqlDialect
         return if (isMysqlDialect) {
@@ -352,4 +407,6 @@ class R2dbcDatabaseMetadataImpl(
     private fun Row.getString(name: String): String? = get(name, java.lang.String::class.java)?.toString()
 
     private fun Row.getBoolean(name: String): Boolean = get(name, java.lang.Boolean::class.java)?.booleanValue() ?: false
+
+    private fun Row.getLong(name: String): Long? = get(name, java.lang.Long::class.java)?.toLong()
 }

@@ -157,7 +157,7 @@ class PostgreSQLMetadata : MetadataProvider(PostgreSQLPropertyProvider, PostgreS
 
     override fun getTables(catalog: String?, schemaPattern: String?, tableNamePattern: String): String {
         return buildString {
-            append("SELECT NULL AS TABLE_CAT, n.nspname AS TABLE_SCHEM, c.relname AS TABLE_NAME ")
+            append("SELECT current_database() AS TABLE_CAT, n.nspname AS TABLE_SCHEM, c.relname AS TABLE_NAME ")
             append("FROM pg_catalog.pg_namespace n, pg_catalog.pg_class c ")
             append("WHERE c.relnamespace = n.oid ")
             if (!schemaPattern.isNullOrEmpty()) {
