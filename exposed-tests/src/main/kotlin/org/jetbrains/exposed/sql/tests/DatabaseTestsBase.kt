@@ -1,16 +1,14 @@
 package org.jetbrains.exposed.sql.tests
 
+import kotlinx.coroutines.Dispatchers
 import org.jetbrains.exposed.sql.DatabaseConfig
 import org.jetbrains.exposed.sql.Key
+import org.jetbrains.exposed.sql.R2dbcDatabase
 import org.jetbrains.exposed.sql.Schema
 import org.jetbrains.exposed.sql.SchemaUtils
 import org.jetbrains.exposed.sql.Table
 import org.jetbrains.exposed.sql.statements.StatementInterceptor
-import org.jetbrains.exposed.sql.transactions.JdbcTransaction
-import org.jetbrains.exposed.sql.transactions.inTopLevelTransaction
-import org.jetbrains.exposed.sql.transactions.nullableTransactionScope
-import org.jetbrains.exposed.sql.transactions.transaction
-import org.jetbrains.exposed.sql.transactions.transactionManager
+import org.jetbrains.exposed.sql.transactions.*
 import org.junit.Assume
 import org.junit.runner.RunWith
 import org.junit.runners.Parameterized
@@ -61,6 +59,7 @@ abstract class DatabaseTestsBase {
     fun withDb(
         dbSettings: TestDB,
         configure: (DatabaseConfig.Builder.() -> Unit)? = null,
+        // useR2dbc: Boolean = false, // Something like this would be ideal, but would need to suspend to execute R2dbcTransaction
         statement: JdbcTransaction.(TestDB) -> Unit
     ) {
         Assume.assumeTrue(dialect == dbSettings)
@@ -86,6 +85,64 @@ abstract class DatabaseTestsBase {
         }
         val database = dbSettings.db!!
         transaction(database.transactionManager.defaultIsolationLevel, db = database) {
+            maxAttempts = 1
+            registerInterceptor(CurrentTestDBInterceptor)
+            currentTestDB = dbSettings
+            statement(dbSettings)
+        }
+
+        // revert any new configuration to not be carried over to the next test in suite
+        if (configure != null) {
+            dbSettings.db = registeredDb
+        }
+    }
+
+    // This essentially duplicates withDb() above but with suspend transactions
+    // If it's possible to have the 2 together somehow, that would be great.
+    suspend fun withR2dbcDb(
+        db: Collection<TestDB>? = null,
+        excludeSettings: Collection<TestDB> = emptyList(),
+        configure: (DatabaseConfig.Builder.() -> Unit)? = null,
+        statement: suspend R2dbcTransaction.(TestDB) -> Unit
+    ) {
+        if (db != null && dialect !in db) {
+            Assume.assumeFalse(true)
+            return
+        }
+
+        if (dialect in excludeSettings) {
+            Assume.assumeFalse(true)
+            return
+        }
+
+        if (dialect !in TestDB.enabledDialects()) {
+            Assume.assumeFalse(true)
+            return
+        }
+
+        val dbSettings = dialect
+
+        val unregistered = dbSettings !in registeredOnShutdown
+        val newConfiguration = configure != null && !unregistered
+
+        if (unregistered) {
+            dbSettings.beforeConnection()
+            Runtime.getRuntime().addShutdownHook(
+                thread(false) {
+                    dbSettings.afterTestFinished()
+                    registeredOnShutdown.remove(dbSettings)
+                }
+            )
+            registeredOnShutdown += dbSettings
+            dbSettings.db = dbSettings.connectR2dbc(configure ?: {})
+        }
+
+        val registeredDb = dbSettings.db!!
+        if (newConfiguration) {
+            dbSettings.db = dbSettings.connect(configure ?: {})
+        }
+        val database = dbSettings.db!! as R2dbcDatabase
+        suspendTransaction(Dispatchers.IO, database, database.transactionManager.defaultIsolationLevel) {
             maxAttempts = 1
             registerInterceptor(CurrentTestDBInterceptor)
             currentTestDB = dbSettings

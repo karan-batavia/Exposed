@@ -39,6 +39,17 @@ dependencies {
     testCompileOnly(libs.sqlite.jdbc)
     testImplementation(libs.logcaptor)
     testImplementation(libs.kotlinx.coroutines.test)
+
+    // R2DBC
+    implementation(project(":exposed-r2dbc"))
+    implementation(libs.kotlinx.coroutines.reactive)
+    implementation(libs.r2dbc.spi)
+    testRuntimeOnly(libs.r2dbc.h2)
+    testRuntimeOnly(libs.r2dbc.mariadb)
+    testRuntimeOnly(libs.r2dbc.mysql)
+    testRuntimeOnly(libs.r2dbc.oracle)
+    testRuntimeOnly(libs.r2dbc.postgresql)
+    testRuntimeOnly(libs.r2dbc.sqlserver)
 }
 
 tasks.withType<Test>().configureEach {
