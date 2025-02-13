@@ -2,6 +2,8 @@ package org.jetbrains.exposed.sql.vendors
 
 import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.transactions.TransactionManager
+import java.sql.ResultSet
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Common interface for all database dialects.
@@ -77,6 +79,9 @@ interface DatabaseDialect {
     /** Returns the allowed maximum sequence value for a dialect, as a [Long]. */
     val sequenceMaxValue: Long get() = Long.MAX_VALUE
 
+    /** Returns whether Exposed currently supports column type change in migrations for this dialect. */
+    val supportsColumnTypeChange: Boolean get() = false
+
     /** Returns `true` if the database supports the `LIMIT` clause with update and delete statements. */
     fun supportsLimitWithUpdateOrDelete(): Boolean
 
@@ -135,6 +140,8 @@ interface DatabaseDialect {
 
     /** Returns a list of the names of all sequences in the database. */
     fun sequences(): List<String>
+
+    fun existingCheckConstraints(vararg tables: Table): Map<Table, List<CheckConstraint>> = emptyMap()
 
     /** Returns `true` if the dialect supports `SELECT FOR UPDATE` statements, `false` otherwise. */
     fun supportsSelectForUpdate(): Boolean
@@ -201,6 +208,26 @@ interface DatabaseDialect {
         @OptIn(InternalApi::class)
         return TransactionManager.current().db.metadata { resolveReferenceOption(refOption.toString())!! }
     }
+
+    /** Returns a map of all the columns' names mapped to their type. */
+    fun fetchAllColumnTypes(tableName: String): ConcurrentHashMap<String, String> = ConcurrentHashMap()
+
+    /** Returns the SQL type of the column in [resultSet]. */
+    fun getColumnType(resultSet: ResultSet, prefetchedColumnTypes: ConcurrentHashMap<String, String> = ConcurrentHashMap()): String = ""
+
+    /** Returns whether the [columnMetadataSqlType] type and the [columnType] are equivalent.
+     *
+     * [columnMetadataJdbcType], the value of which comes from [java.sql.Types], is taken into consideration if needed by a specific database.
+     * @see [H2Dialect.areEquivalentTypes] */
+    fun areEquivalentTypes(columnMetadataSqlType: String, columnMetadataJdbcType: Int, columnType: String): Boolean =
+        columnMetadataSqlType.equals(columnType, ignoreCase = true) ||
+            equivalentTypesPairs().any { pair ->
+                columnType.equals(pair.first, ignoreCase = true) && columnMetadataSqlType.equals(pair.second, ignoreCase = true) ||
+                    columnType.equals(pair.second, ignoreCase = true) && columnMetadataSqlType.equals(pair.first, ignoreCase = true)
+            }
+
+    /** Returns the pairs of column type values that are equivalent to one another. */
+    fun equivalentTypesPairs(): Set<Pair<String, String>> = setOf()
 
     companion object {
         private val defaultLikePatternSpecialChars = mapOf('%' to null, '_' to null)

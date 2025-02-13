@@ -4,7 +4,10 @@ import org.jetbrains.exposed.exceptions.throwUnsupportedException
 import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.statements.StatementType
 import org.jetbrains.exposed.sql.transactions.TransactionManager
+import java.sql.ResultSet
+import java.sql.Types
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
 
 internal object H2DataTypeProvider : DataTypeProvider() {
     override fun binaryType(): String = "VARBINARY"
@@ -298,11 +301,41 @@ open class H2Dialect : VendorDialect(dialectName, H2DataTypeProvider, H2Function
     override val supportsDualTableConcept: Boolean by lazy { resolveDelegatedDialect()?.supportsDualTableConcept ?: super.supportsDualTableConcept }
     override val supportsOrderByNullsFirstLast: Boolean by lazy { resolveDelegatedDialect()?.supportsOrderByNullsFirstLast ?: super.supportsOrderByNullsFirstLast }
     override val supportsWindowFrameGroupsMode: Boolean by lazy { resolveDelegatedDialect()?.supportsWindowFrameGroupsMode ?: super.supportsWindowFrameGroupsMode }
-//    override val likePatternSpecialChars: Map<Char, Char?> by lazy { resolveDelegatedDialect()?.likePatternSpecialChars ?: super.likePatternSpecialChars }
+    override val supportsColumnTypeChange: Boolean get() = isSecondVersion
 
     override fun existingIndices(vararg tables: Table): Map<Table, List<Index>> =
         super.existingIndices(*tables).mapValues { entry -> entry.value.filterNot { it.indexName.startsWith("PRIMARY_KEY_") } }
             .filterValues { it.isNotEmpty() }
+
+    override fun existingCheckConstraints(vararg tables: Table): Map<Table, List<CheckConstraint>> {
+        val result = mutableMapOf<Table, List<CheckConstraint>>()
+        tables.forEach { table ->
+            val transaction = TransactionManager.current()
+            val checkConstraints = mutableListOf<CheckConstraint>()
+            transaction.exec(
+                """
+                    SELECT tc.CONSTRAINT_NAME, cc.CHECK_CLAUSE
+                    FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+                    JOIN INFORMATION_SCHEMA.CHECK_CONSTRAINTS cc
+                        ON tc.CONSTRAINT_NAME = cc.CONSTRAINT_NAME
+                    WHERE tc.CONSTRAINT_TYPE = 'CHECK'
+                    AND tc.TABLE_NAME = '${table.nameInDatabaseCaseUnquoted()}';
+                """.trimIndent()
+            ) { rs ->
+                while (rs.next()) {
+                    checkConstraints.add(
+                        CheckConstraint(
+                            tableName = transaction.identity(table),
+                            checkName = rs.getString(1),
+                            checkOp = rs.getString(2)
+                        )
+                    )
+                }
+            }
+            result[table] = checkConstraints
+        }
+        return result
+    }
 
     override fun isAllowedAsColumnDefault(e: Expression<*>): Boolean = true
 
@@ -337,6 +370,135 @@ open class H2Dialect : VendorDialect(dialectName, H2DataTypeProvider, H2Function
         super.modifyColumn(column, columnDiff).map { it.replace("MODIFY COLUMN", "ALTER COLUMN") }
 
     override fun dropDatabase(name: String) = "DROP SCHEMA IF EXISTS ${name.inProperCase()}"
+
+    override fun fetchAllColumnTypes(tableName: String): ConcurrentHashMap<String, String> {
+        val map = ConcurrentHashMap<String, String>()
+        TransactionManager.current().exec("SHOW COLUMNS FROM $tableName") { rs ->
+            while (rs.next()) {
+                val field = rs.getString("FIELD")
+                val type = rs.getString("TYPE").uppercase()
+                map[field] = type
+            }
+        }
+        return map
+    }
+
+    // All H2 V1 databases are excluded because Exposed will be dropping support for it soon
+    override fun getColumnType(resultSet: ResultSet, prefetchedColumnTypes: ConcurrentHashMap<String, String>): String {
+        val columnName = resultSet.getString("COLUMN_NAME")
+        val columnType = prefetchedColumnTypes[columnName] ?: resultSet.getString("TYPE_NAME").uppercase()
+        val dataType = resultSet.getInt("DATA_TYPE")
+        return if (dataType == Types.ARRAY) {
+            val baseType = columnType.substringBefore(" ARRAY")
+            normalizedColumnType(baseType) + columnType.replaceBefore(" ARRAY", "")
+        } else {
+            normalizedColumnType(columnType)
+        }
+    }
+
+    /** Returns the normalized column type. */
+    private fun normalizedColumnType(columnType: String): String =
+        when {
+            columnType.matches(Regex("CHARACTER VARYING(?:\\(\\d+\\))?")) -> when (h2Mode) {
+                H2CompatibilityMode.Oracle -> columnType.replace("CHARACTER VARYING", "VARCHAR2")
+                else -> columnType.replace("CHARACTER VARYING", "VARCHAR")
+            }
+            columnType.matches(Regex("CHARACTER(?:\\(\\d+\\))?")) -> columnType.replace("CHARACTER", "CHAR")
+            columnType.matches(Regex("BINARY VARYING(?:\\(\\d+\\))?")) -> when (h2Mode) {
+                H2CompatibilityMode.PostgreSQL -> "bytea"
+                H2CompatibilityMode.Oracle -> columnType.replace("BINARY VARYING", "RAW")
+                else -> columnType.replace("BINARY VARYING", "VARBINARY")
+            }
+            columnType == "BOOLEAN" -> when (h2Mode) {
+                H2CompatibilityMode.SQLServer -> "BIT"
+                else -> columnType
+            }
+            columnType == "BINARY LARGE OBJECT" -> "BLOB"
+            columnType == "CHARACTER LARGE OBJECT" -> "CLOB"
+            columnType == "INTEGER" && h2Mode != H2CompatibilityMode.Oracle -> "INT"
+            else -> columnType
+        }
+
+    override fun areEquivalentTypes(columnMetadataSqlType: String, columnMetadataJdbcType: Int, columnType: String): Boolean {
+        if (super.areEquivalentTypes(columnMetadataSqlType, columnMetadataJdbcType, columnType)) {
+            return true
+        }
+        if (columnMetadataJdbcType == Types.ARRAY) {
+            val baseType = columnMetadataSqlType.substringBefore(" ARRAY")
+            return areEquivalentTypes(baseType, Types.OTHER, columnType.substringBefore(" ARRAY")) &&
+                areEquivalentTypes(columnMetadataSqlType.replaceBefore("ARRAY", ""), Types.OTHER, columnType.replaceBefore("ARRAY", ""))
+        }
+        if (listOf(columnMetadataSqlType, columnType).all { it.matches(Regex("VARCHAR(?:\\((?:MAX|\\d+)\\))?")) }) {
+            return true
+        }
+        if (listOf(columnMetadataSqlType, columnType).all { it.matches(Regex("VARBINARY(?:\\((?:MAX|\\d+)\\))?")) }) {
+            return true
+        }
+        return when (h2Mode) {
+            H2CompatibilityMode.Oracle -> {
+                when {
+                    // Unlike Oracle, H2 Oracle mode does not distinguish between VARCHAR2(4000) and VARCHAR2(4000 CHAR).
+                    // It treats the length as a character count and does not enforce a separate byte limit.
+                    listOf(columnMetadataSqlType, columnType).all { it.matches(Regex("VARCHAR2(?:\\((?:MAX|\\d+)(?:\\s+CHAR)?\\))?")) } -> true
+                    else -> {
+                        // H2 maps NUMBER to NUMERIC
+                        val numberRegex = Regex("NUMBER(?:\\((\\d+)(?:,\\s?(\\d+))?\\))?")
+                        val numericRegex = Regex("NUMERIC(?:\\((\\d+)(?:,\\s?(\\d+))?\\))?")
+                        val numberMatch = numberRegex.find(columnType.uppercase())
+                        val numericMatch = numericRegex.find(columnMetadataSqlType.uppercase())
+                        if (numberMatch != null && numericMatch != null) {
+                            numberMatch.groupValues[1] == numericMatch.groupValues[1] // compare precision
+                        } else {
+                            false
+                        }
+                    }
+                }
+            }
+            H2CompatibilityMode.SQLServer ->
+                when {
+                    // Auto-increment difference is dealt with elsewhere
+                    columnType.contains(" IDENTITY") ->
+                        areEquivalentTypes(columnMetadataSqlType, columnMetadataJdbcType, columnType.substringBefore(" IDENTITY"))
+                    // H2 maps DATETIME2 to TIMESTAMP
+                    columnType.uppercase().matches(Regex("DATETIME2(?:\\(\\d+\\))?")) &&
+                        columnMetadataSqlType.uppercase().matches(Regex("TIMESTAMP(?:\\(\\d+\\))?")) -> true
+                    // H2 maps NVARCHAR to VARCHAR
+                    columnType.uppercase().matches(Regex("NVARCHAR(?:\\((\\d+|MAX)\\))?")) &&
+                        columnMetadataSqlType.uppercase().matches(Regex("VARCHAR(?:\\((\\d+|MAX)\\))?")) -> true
+                    else -> false
+                }
+            null, H2CompatibilityMode.MySQL, H2CompatibilityMode.MariaDB ->
+                when {
+                    // Auto-increment difference is dealt with elsewhere
+                    columnType.contains(" AUTO_INCREMENT") ->
+                        areEquivalentTypes(columnMetadataSqlType, columnMetadataJdbcType, columnType.substringBefore(" AUTO_INCREMENT"))
+                    // H2 maps DATETIME to TIMESTAMP
+                    columnType.uppercase().matches(Regex("DATETIME(?:\\(\\d+\\))?")) &&
+                        columnMetadataSqlType.uppercase().matches(Regex("TIMESTAMP(?:\\(\\d+\\))?")) -> true
+                    else -> false
+                }
+            else -> false
+        }
+    }
+
+    override fun equivalentTypesPairs(): Set<Pair<String, String>> = hashSetOf(
+        "TEXT" to "VARCHAR"
+    ).apply {
+        when (h2Mode) {
+            H2CompatibilityMode.Oracle -> this.add("DATE" to "TIMESTAMP(0)")
+            H2CompatibilityMode.SQLServer -> this.add("uniqueidentifier" to "UUID")
+            H2CompatibilityMode.PostgreSQL -> this.addAll(
+                listOf(
+                    // Auto-increment difference is dealt with elsewhere
+                    "SERIAL" to "INT",
+                    "BIGSERIAL" to "BIGINT"
+                )
+            )
+            else -> {
+                /* Do nothing */
+            }
+        }
+    }
 
     companion object : DialectNameProvider("H2")
 }
